@@ -15,6 +15,7 @@ class GLiNERConfig(PretrainedConfig):
                  fine_tune: bool = True,
                  subtoken_pooling: str = "first",
                  span_mode: str = "markerV0",
+                 pre_fusion: bool = False,
                  post_fusion_schema: str = '', #l2l-l2t-t2t
                  num_post_fusion_layers: int = 1, 
                  vocab_size: int = -1,
@@ -25,7 +26,7 @@ class GLiNERConfig(PretrainedConfig):
                  has_rnn: bool = True,
                  fuse_layers: bool = False,
                  embed_ent_token: bool = True,
-                 class_token_index: int = -1,
+                 class_token_index: int = 128001,
                  encoder_config: Optional[dict] = None,
                  labels_encoder_config: Optional[dict] = None,
                  ent_token = "<<ENT>>",
@@ -55,6 +56,7 @@ class GLiNERConfig(PretrainedConfig):
         self.fine_tune = fine_tune
         self.subtoken_pooling = subtoken_pooling
         self.span_mode = span_mode
+        self.pre_fusion = pre_fusion
         self.post_fusion_schema = post_fusion_schema
         self.num_post_fusion_layers = num_post_fusion_layers
         self.vocab_size = vocab_size

@@ -9,7 +9,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from transformers.utils import ModelOutput
 
-from .encoder import Encoder, BiEncoder
+from .encoder import Encoder, BiEncoder, BiPreEncoder
 from .layers import LstmSeq2SeqEncoder, CrossFuser, create_projection_layer
 from .scorers import Scorer
 from .loss_functions import focal_loss_with_logits
@@ -50,7 +50,7 @@ def extract_prompt_features_and_word_embeddings(config, token_embeds, input_ids,
 
     class_token_mask = input_ids == config.class_token_index
     num_class_tokens = torch.sum(class_token_mask, dim=-1, keepdim=True)
-
+    
     max_embed_dim = num_class_tokens.max()
     max_text_length = text_lengths.max()
     aranged_class_idx = torch.arange(max_embed_dim, 
@@ -65,15 +65,14 @@ def extract_prompt_features_and_word_embeddings(config, token_embeds, input_ids,
     prompts_embedding = torch.zeros(
         batch_size, max_embed_dim, embed_dim, dtype=token_embeds.dtype, device=token_embeds.device
     )
-
     prompts_embedding_mask = (aranged_class_idx < num_class_tokens).to(attention_mask.dtype)
 
     prompts_embedding[batch_indices, target_class_idx] = token_embeds[batch_indices, class_indices]
-    
+
     #getting words embedding
     words_embedding, mask = extract_word_embeddings(token_embeds, words_mask, attention_mask, 
                                     batch_size, max_text_length, embed_dim, text_lengths)
-
+    
     return prompts_embedding, prompts_embedding_mask, words_embedding, mask
 
 class BaseModel(ABC, nn.Module):
@@ -83,6 +82,8 @@ class BaseModel(ABC, nn.Module):
         
         if not config.labels_encoder:
             self.token_rep_layer = Encoder(config, from_pretrained)
+        elif config.pre_fusion:
+            self.token_rep_layer = BiPreEncoder(config, from_pretrained)
         else:
             self.token_rep_layer = BiEncoder(config, from_pretrained)
         if self.config.has_rnn:
@@ -164,6 +165,34 @@ class BaseModel(ABC, nn.Module):
         
         return labels_embeds, labels_mask, words_embedding, mask
 
+    def get_bi_pre_fusion_representations(self, 
+                input_ids: Optional[torch.FloatTensor] = None,
+                attention_mask: Optional[torch.LongTensor] = None,
+                labels_embeds: Optional[torch.FloatTensor] = None,
+                labels_input_ids: Optional[torch.FloatTensor] = None,
+                labels_attention_mask: Optional[torch.LongTensor] = None,
+                text_lengths: Optional[torch.Tensor] = None,
+                words_mask: Optional[torch.LongTensor] = None,
+                **kwargs): 
+        if labels_embeds is not None:
+            token_embeds = self.token_rep_layer.encode_text_and_labels(input_ids, attention_mask, labels_embeds, **kwargs)
+        else:
+            token_embeds, labels_embeds = self.token_rep_layer(input_ids, attention_mask,
+                                                           labels_input_ids, labels_attention_mask, 
+                                                                                            **kwargs) 
+        (post_label_embeds, 
+            post_labels_mask, 
+                words_embedding, 
+                    mask) = self._extract_prompt_features_and_word_embeddings(token_embeds, input_ids, attention_mask, 
+                                                                                                        text_lengths, words_mask)
+        
+
+        post_label_embeds = post_label_embeds.to(words_embedding.dtype)
+        if hasattr(self, "cross_fuser"):
+            words_embedding, post_label_embeds = self.features_enhancement(words_embedding, labels_embeds, text_mask=mask, labels_mask=post_labels_mask)
+        
+        return post_label_embeds, post_labels_mask, words_embedding, mask
+    
     def get_representations(self, 
             input_ids: Optional[torch.FloatTensor] = None,
             attention_mask: Optional[torch.LongTensor] = None,
@@ -174,10 +203,16 @@ class BaseModel(ABC, nn.Module):
             words_mask: Optional[torch.LongTensor] = None,
             **kwargs):
         if self.config.labels_encoder:
-            prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_bi_representations(
-                    input_ids, attention_mask, labels_embeddings, labels_input_ids, labels_attention_mask, 
-                                                                        text_lengths, words_mask, **kwargs
-            )
+            if self.config.pre_fusion:
+                prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_bi_pre_fusion_representations(
+                        input_ids, attention_mask, labels_embeddings, labels_input_ids, labels_attention_mask, 
+                                                                            text_lengths, words_mask, **kwargs
+                )
+            else:
+                prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_bi_representations(
+                        input_ids, attention_mask, labels_embeddings, labels_input_ids, labels_attention_mask, 
+                                                                            text_lengths, words_mask, **kwargs
+                )
         else:
             prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_uni_representations(
                                     input_ids, attention_mask, text_lengths, words_mask, **kwargs

@@ -54,7 +54,7 @@ if __name__ == '__main__':
 
         model = GLiNER(model_config, tokenizer=tokenizer, words_splitter=words_splitter)
 
-        if not config.labels_encoder:
+        if not config.labels_encoder or config.pre_fusion:
             model_config.class_token_index=len(tokenizer)
             tokenizer.add_tokens([model_config.ent_token, model_config.sep_token], special_tokens=True)
             model_config.vocab_size = len(tokenizer)
