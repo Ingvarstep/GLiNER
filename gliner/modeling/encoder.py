@@ -207,6 +207,7 @@ class BiPreEncoder(BiEncoder):
                     labels_input_ids = None, labels_attention_mask=None, 
                                             *args, **kwargs) -> torch.Tensor:
         labels_embeddings = self.encode_labels(labels_input_ids, labels_attention_mask, *args, **kwargs)
+        labels_embeddings = labels_embeddings.to(dtype=self.bert_layer.model.dtype)
         if hasattr(self, "labels_projection"):
             labels_embeddings = self.pre_labels_projection(labels_embeddings)
 
