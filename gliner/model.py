@@ -2271,7 +2271,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         self,
         texts: Union[str, List[str]],
         labels: List[str],
-        relations: List[str],
+        relations: List[str] = [],
         flat_ner: bool = True,
         threshold: float = 0.5,
         adjacency_threshold: Optional[float] = None,
