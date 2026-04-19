@@ -20,7 +20,7 @@
     <br>
 </div>
 
-GLiNER is a framework for training and deploying Named Entity Recognition (NER) models that can identify any entity type using bidirectional transformer encoders (BERT-like). Beyond standard NER, GLiNER supports multiple tasks including joint entity and relation extraction through specialized architectures. It provides a practical alternative to both traditional NER models, which are limited to predefined entity types, and Large Language Models (LLMs), which offer flexibility but require significant computational resources.
+GLiNER is a framework for training and deploying small Named Entity Recognition (NER) models with zero-shot capabilities. In addition to tradition NER, it also supports joint entity and relation extraction. GLiNER is fine-tunable, optimized to run on CPUs and consumer hardware, and has performance competitive with LLMs several times its size, like ChatGPT and UniNER.
 
 
 ## Example Notebooks
@@ -32,8 +32,20 @@ Explore various examples including finetuning, ONNX conversion, and synthetic da
 ## 🛠 Installation & Usage
 
 ### Installation
+
+**With pip:**
 ```bash
-!pip install gliner
+pip install gliner
+```
+
+**With uv (faster):**
+```bash
+uv pip install gliner
+```
+
+**With serving support (Ray Serve):**
+```bash
+uv pip install gliner[serve]  # or: pip install gliner ray[serve]
 ```
 
 ### Usage
@@ -77,6 +89,50 @@ UEFA European Championship => competitions
 UEFA Nations League => competitions
 European Championship => competitions
 ```
+
+## 🚀 Serving
+
+GLiNER ships with a production-ready Ray Serve deployment that adds dynamic batching, memory-aware batch sizing, precompiled power-of-two batch sizes, and multi-replica scaling. Install with `pip install gliner[serve]`.
+
+**In-process (vLLM-style):**
+
+```python
+from gliner.serve import GLiNERFactory
+
+with GLiNERFactory(
+    model="urchade/gliner_medium-v2.1",
+    dtype="bfloat16",
+    enable_flashdeberta=True,
+) as llm:
+    outputs = llm.predict(
+        ["John works at Google", "Paris is in France"],
+        labels=["person", "organization", "location"],
+    )
+```
+
+Passing a list of texts preserves dynamic batching — each text is dispatched as a separate request so Ray Serve's `@serve.batch` accumulates them into a single forward pass. Use `predict_async` for concurrent `asyncio` calls and `.handle` to reach the underlying Ray Serve handle.
+
+**Standalone HTTP server:**
+
+```bash
+python -m gliner.serve --model urchade/gliner_small-v2.1 --enable-flashdeberta
+```
+
+```bash
+curl -X POST http://localhost:8000/gliner \
+  -H "Content-Type: application/json" \
+  -d '{"text": "John works at Google", "labels": ["person", "organization"]}'
+```
+
+**Attach a remote client to a running server:**
+
+```python
+from gliner.serve import GLiNERClient
+client = GLiNERClient()
+result = client.predict("John works at Google", labels=["person", "organization"])
+```
+
+For all CLI flags, Docker usage, relation-extraction examples, and tuning knobs (memory fractions, precompiled batch sizes, sequence packing), see the [Serving guide](docs/serving.md).
 
 ## 👨‍💻 Model Authors
 GLiNER was originally developed by:
@@ -140,6 +196,18 @@ If you find GLiNER useful in your research, please consider citing our papers:
       archivePrefix={arXiv},
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2406.12925}, 
+}
+```
+
+```bibtex
+@misc{stepanov2026millionlabelnerbreakingscale,
+      title={The Million-Label NER: Breaking Scale Barriers with GLiNER bi-encoder}, 
+      author={Ihor Stepanov and Mykhailo Shtopko and Dmytro Vodianytskyi and Oleksandr Lukashov},
+      year={2026},
+      eprint={2602.18487},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2602.18487}, 
 }
 ```
 ## Support and funding

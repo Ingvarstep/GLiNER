@@ -26,6 +26,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .utils import (
+    build_all_entity_pairs,
     build_entity_pairs,
     extract_prompt_features,
     extract_word_embeddings,
@@ -305,6 +306,7 @@ class BaseUniEncoderModel(BaseModel):
                 - words_embedding: Word embeddings of shape (B, W, D).
                 - mask: Mask for words of shape (B, W).
         """
+        word_lengths = kwargs.pop("word_lengths", None)
         token_embeds = self.token_rep_layer(input_ids, attention_mask, **kwargs)
 
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
@@ -314,7 +316,7 @@ class BaseUniEncoderModel(BaseModel):
         )
 
         if hasattr(self, "rnn"):
-            words_embedding = self.rnn(words_embedding, mask)
+            words_embedding = self.rnn(words_embedding, mask, lengths=word_lengths)
 
         return prompts_embedding, prompts_embedding_mask, words_embedding, mask
 
@@ -384,7 +386,7 @@ class UniEncoderSpanModel(BaseUniEncoderModel):
         Returns:
             GLiNERBaseOutput containing logits, loss, and intermediate representations.
         """
-        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask") if key in kwargs}
+        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask", "token_lengths", "word_lengths") if key in kwargs}
 
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
             input_ids, attention_mask, text_lengths, words_mask, **encoder_kwargs
@@ -477,7 +479,8 @@ class UniEncoderSpanModel(BaseUniEncoderModel):
         all_losses = all_losses * span_mask.float()
 
         if reduction == "mean":
-            loss = all_losses.mean()
+            num_valid = span_mask.float().sum()
+            loss = all_losses.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, device=scores.device)
         elif reduction == "sum":
             loss = all_losses.sum()
         else:
@@ -580,7 +583,7 @@ class UniEncoderTokenModel(BaseUniEncoderModel):
         Returns:
             GLiNERBaseOutput containing logits, loss, embeddings, and span-level outputs.
         """
-        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask") if key in kwargs}
+        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask", "token_lengths", "word_lengths") if key in kwargs}
 
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
             input_ids, attention_mask, text_lengths, words_mask, **encoder_kwargs
@@ -679,7 +682,8 @@ class UniEncoderTokenModel(BaseUniEncoderModel):
         all_losses = all_losses * mask
 
         if reduction == "mean":
-            loss = all_losses.mean()
+            num_valid = mask.float().sum()
+            loss = all_losses.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, device=scores.device)
         elif reduction == "sum":
             loss = all_losses.sum()
         else:
@@ -783,6 +787,10 @@ class BaseBiEncoderModel(BaseModel):
                 - words_embedding: Word embeddings of shape (B, W, D).
                 - mask: Mask for words of shape (B, W).
         """
+        # word_lengths is only consumed by the RNN path; drop it here so it does
+        # not leak into the label encoder's forward as an unexpected kwarg.
+        kwargs.pop("word_lengths", None)
+
         if labels_embeds is not None:
             token_embeds = self.token_rep_layer.encode_text(input_ids, attention_mask, **kwargs)
         else:
@@ -879,7 +887,7 @@ class BiEncoderSpanModel(BaseBiEncoderModel):
         Returns:
             GLiNERBaseOutput containing logits, loss, and intermediate representations.
         """
-        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask") if key in kwargs}
+        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask", "token_lengths", "word_lengths") if key in kwargs}
 
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
             input_ids,
@@ -976,7 +984,8 @@ class BiEncoderSpanModel(BaseBiEncoderModel):
         all_losses = all_losses * mask_label.float()
 
         if reduction == "mean":
-            loss = all_losses.mean()
+            num_valid = mask_label.float().sum()
+            loss = all_losses.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, device=scores.device)
         elif reduction == "sum":
             loss = all_losses.sum()
         else:
@@ -1055,7 +1064,7 @@ class BiEncoderTokenModel(BaseBiEncoderModel, UniEncoderTokenModel):
         Returns:
             GLiNERBaseOutput containing logits, loss, and intermediate representations.
         """
-        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask") if key in kwargs}
+        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask", "token_lengths", "word_lengths") if key in kwargs}
 
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
             input_ids,
@@ -1167,9 +1176,18 @@ class UniEncoderSpanDecoderModel(UniEncoderSpanModel):
                 - sel_idx: LongTensor of shape (B, M) with original column indices
                   (-1 for padding positions).
         """
-        B, _, D = representations.shape
+        B, N, D = representations.shape
         lengths = rep_mask.sum(dim=-1)
-        max_len = lengths.max().item()
+
+        # Determining ``max_len`` via ``lengths.max().item()`` forces a GPU→CPU sync.
+        # Under ``torch.compile`` with ``capture_scalar_outputs=True`` the ``.item()``
+        # is traced symbolically; in eager execution we fall back to the upper bound
+        # ``N`` so we never block. The mask-based scatter below is correct either way —
+        # padding positions stay zero and are flagged by ``target_mask``/``sel_idx``.
+        if torch.compiler.is_compiling():
+            max_len = lengths.max().item()
+        else:
+            max_len = N
 
         target_rep = representations.new_zeros(B, max_len, D)
         target_mask = rep_mask.new_zeros(B, max_len)
@@ -1467,7 +1485,7 @@ class UniEncoderSpanDecoderModel(UniEncoderSpanModel):
         Returns:
             GLiNERDecoderOutput containing logits, losses, and decoder information.
         """
-        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask") if key in kwargs}
+        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask", "token_lengths", "word_lengths") if key in kwargs}
 
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
             input_ids, attention_mask, text_lengths, words_mask, **encoder_kwargs
@@ -1588,7 +1606,8 @@ class UniEncoderSpanDecoderModel(UniEncoderSpanModel):
         all_losses = all_losses * mask_label.float()
 
         if reduction == "mean":
-            loss = all_losses.mean()
+            num_valid = mask_label.float().sum()
+            loss = all_losses.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, device=scores.device)
         elif reduction == "sum":
             loss = all_losses.sum()
         else:
@@ -1814,7 +1833,7 @@ class UniEncoderTokenDecoderModel(UniEncoderTokenModel, UniEncoderSpanDecoderMod
         Returns:
             GLiNERDecoderOutput containing logits, losses, and decoder information.
         """
-        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask") if key in kwargs}
+        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask", "token_lengths", "word_lengths") if key in kwargs}
 
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
             input_ids, attention_mask, text_lengths, words_mask, **encoder_kwargs
@@ -2010,9 +2029,10 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         super().__init__(config, from_pretrained, cache_dir)
 
         if config.relations_layer is not None:
-            self.relations_rep_layer = RelationsRepLayer(
-                in_dim=config.hidden_size, relation_mode=config.relations_layer
-            )
+            if config.relations_layer != "none":
+                self.relations_rep_layer = RelationsRepLayer(
+                    in_dim=config.hidden_size, relation_mode=config.relations_layer
+                )
 
             if config.triples_layer is not None:
                 self.triples_score_layer = TriplesScoreLayer(config.triples_layer)
@@ -2029,7 +2049,8 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         span_labels: Optional[torch.FloatTensor] = None,
         threshold: float = 0.5,
         top_k: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        span_idx: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Select entity spans for relation extraction.
 
         Filters spans based on entity classification scores or ground truth labels,
@@ -2042,11 +2063,15 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
             span_labels: Optional ground truth labels of shape (B, L, K, C).
             threshold: Confidence threshold for selecting spans.
             top_k: Optional limit on number of spans to select.
+            span_idx: Optional span boundary indices of shape (B, L*K, 2).
+                If provided, selected boundaries are returned for decoding.
 
         Returns:
             Tuple containing:
                 - target_rep: Selected span representations of shape (B, E, D).
                 - target_mask: Mask for selected spans of shape (B, E).
+                - target_span_idx: Selected span boundaries of shape (B, E, 2),
+                    or None if span_idx was not provided.
         """
         B = span_rep.size(0)
         D = span_rep.size(-1)
@@ -2054,12 +2079,14 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         span_rep_flat = span_rep.view(B, -1, D)
         span_mask_flat = span_mask.view(B, -1)
 
-        if span_labels is not None:
+        if span_labels is not None and span_labels.size(-1) > 0:
             span_prob_flat = span_labels.max(dim=-1).values.view(B, -1)
             keep = (span_prob_flat == 1).bool()
-        else:
+        elif span_scores is not None and span_scores.size(-1) > 0:
             span_prob_flat = torch.sigmoid(span_scores).max(dim=-1).values.view(B, -1)
             keep = (span_prob_flat > threshold) & span_mask_flat.bool()
+        else:
+            keep = torch.zeros_like(span_mask_flat, dtype=torch.bool)
 
         if top_k is not None and top_k > 0:
             sel_scores = span_prob_flat.masked_fill(~keep, -1.0)
@@ -2071,7 +2098,16 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
 
         target_rep, target_mask = self.select_target_embedding(representations=span_rep_flat, rep_mask=rep_mask)
 
-        return target_rep, target_mask
+        # Also select span boundaries using the same mask
+        target_span_idx = None
+        if span_idx is not None:
+            span_idx_float = span_idx.float()
+            target_span_idx_float, _ = self.select_target_embedding(
+                representations=span_idx_float, rep_mask=rep_mask
+            )
+            target_span_idx = target_span_idx_float.long()
+
+        return target_rep, target_mask, target_span_idx
 
     def select_target_embedding(
         self, representations: Optional[torch.FloatTensor] = None, rep_mask: Optional[torch.LongTensor] = None
@@ -2088,8 +2124,17 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
                 - target_mask: Packed mask of shape (B, M).
         """
         B, N, D = representations.shape
-        lengths = rep_mask.sum(dim=-1)
-        max_len = lengths.max().item()
+
+        # ``lengths.max().item()`` would force a GPU→CPU sync to compress the output
+        # from ``N`` to ``max_len``. Under ``torch.compile`` with ``capture_scalar_outputs``
+        # the sync is traced symbolically and we keep the packing benefit; in eager
+        # execution we skip packing (use the full ``N``) to stay sync-free, at the cost
+        # of some downstream compute that masked positions would have saved.
+        if torch.compiler.is_compiling():
+            lengths = rep_mask.sum(dim=-1)
+            max_len = lengths.max().item()
+        else:
+            max_len = N
 
         if max_len != N:
             target_rep = representations.new_zeros(B, max_len, D)
@@ -2123,13 +2168,14 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         span_rep = self.span_rep_layer(words_embeddings, span_idx)
         scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embeddings)
 
-        if hasattr(self, "relations_rep_layer"):
-            target_span_rep, target_span_mask = self.select_span_target_embedding(
-                span_rep, scores, span_mask, labels, threshold
+        has_relex = hasattr(self, "relations_rep_layer") or hasattr(self, "pair_rep_layer") or hasattr(self, "triples_score_layer")
+        if has_relex:
+            target_span_rep, target_span_mask, entity_spans = self.select_span_target_embedding(
+                span_rep, scores, span_mask, labels, threshold, span_idx=span_idx
             )
         else:
-            target_span_rep, target_span_mask = None, None
-        return scores, target_span_rep, target_span_mask
+            target_span_rep, target_span_mask, entity_spans = None, None, None
+        return scores, target_span_rep, target_span_mask, entity_spans
 
     def forward(
         self,
@@ -2173,7 +2219,8 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         Returns:
             GLiNERRelexOutput containing entity and relation predictions.
         """
-        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask") if key in kwargs}
+        encoder_kwargs = {key: kwargs[key] for key in ("packing_config", "pair_attention_mask", "token_lengths", "word_lengths") if key in kwargs}
+        word_lengths = encoder_kwargs.pop("word_lengths", None)
 
         token_embeds = self.token_rep_layer(input_ids, attention_mask, **encoder_kwargs)
 
@@ -2184,7 +2231,7 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         )
 
         if hasattr(self, "rnn"):
-            words_embedding = self.rnn(words_embedding, mask)
+            words_embedding = self.rnn(words_embedding, mask, lengths=word_lengths)
 
         if self.config.span_mode == "token_level":
             if labels is not None:
@@ -2208,7 +2255,7 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         prompts_embedding = self.prompt_rep_layer(prompts_embedding)
         batch_size, _, embed_dim = prompts_embedding.shape
 
-        scores, target_span_rep, target_span_mask = self.represent_spans(
+        scores, target_span_rep, target_span_mask, entity_spans = self.represent_spans(
             words_embedding, mask, prompts_embedding, span_idx, span_mask, labels, threshold
         )
 
@@ -2216,8 +2263,11 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
         rel_prompts_embedding_mask = None
         pred_adj_matrix = None
 
-        if hasattr(self, "relations_rep_layer"):
-            pred_adj_matrix = self.relations_rep_layer(target_span_rep, target_span_mask)
+        has_relex = hasattr(self, "relations_rep_layer") or hasattr(self, "pair_rep_layer") or hasattr(self, "triples_score_layer")
+
+        if has_relex:
+            if hasattr(self, "relations_rep_layer"):
+                pred_adj_matrix = self.relations_rep_layer(target_span_rep, target_span_mask)
 
             rel_prompts_embedding, rel_prompts_embedding_mask = extract_prompt_features(
                 self.config.rel_token_index,
@@ -2232,11 +2282,15 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
             B, _, D = target_span_rep.shape
             C_rel = rel_prompts_embedding.size(1)
 
-            adj_for_selection = adj_matrix if (labels is not None and adj_matrix is not None) else pred_adj_matrix
-
-            pair_idx, pair_mask, head_rep_selected, tail_rep_selected = build_entity_pairs(
-                adj_for_selection, target_span_rep, threshold=adjacency_threshold
-            )
+            if hasattr(self, "relations_rep_layer"):
+                adj_for_selection = adj_matrix if (labels is not None and adj_matrix is not None) else pred_adj_matrix
+                pair_idx, pair_mask, head_rep_selected, tail_rep_selected = build_entity_pairs(
+                    adj_for_selection, target_span_rep, threshold=adjacency_threshold
+                )
+            else:
+                pair_idx, pair_mask, head_rep_selected, tail_rep_selected = build_all_entity_pairs(
+                    target_span_rep, target_span_mask
+                )
 
             N = head_rep_selected.size(1)
 
@@ -2259,24 +2313,61 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
 
         loss = None
         if labels is not None:
-            loss = self.loss(scores, labels, prompts_embedding_mask, span_mask=span_mask, word_mask=mask, **kwargs)
+            num_ner_classes = prompts_embedding_mask.shape[-1]
+            if num_ner_classes > 0:
+                loss = self.loss(scores, labels, prompts_embedding_mask, span_mask=span_mask, word_mask=mask, **kwargs)
 
-            if adj_matrix is not None and rel_matrix is not None and hasattr(self, "relations_rep_layer"):
-                adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
-                adj_loss = self.adj_loss(pred_adj_matrix, adj_matrix, adj_mask, **kwargs)
-
+            if has_relex and rel_matrix is not None and C_rel > 0:
                 rel_labels_selected = rel_matrix
+                # Align rel_labels_selected to N (pairs from build_entity_pairs / build_all_entity_pairs).
+                # They should match by construction, but can differ by 1 in edge cases.
+                if rel_labels_selected.size(1) != N:
+                    if rel_labels_selected.size(1) > N:
+                        rel_labels_selected = rel_labels_selected[:, :N, :]
+                    else:
+                        pad = rel_labels_selected.new_zeros(B, N - rel_labels_selected.size(1), rel_labels_selected.size(2))
+                        rel_labels_selected = torch.cat([rel_labels_selected, pad], dim=1)
+
+                # Align rel_labels_selected to C_rel (relation classes from prompt embeddings).
+                # rel_matrix uses C from rel_class_to_ids which can differ from C_rel.
+                if rel_labels_selected.size(2) != C_rel:
+                    if rel_labels_selected.size(2) > C_rel:
+                        rel_labels_selected = rel_labels_selected[:, :, :C_rel]
+                    else:
+                        pad = rel_labels_selected.new_zeros(B, rel_labels_selected.size(1), C_rel - rel_labels_selected.size(2))
+                        rel_labels_selected = torch.cat([rel_labels_selected, pad], dim=2)
+
                 rel_mask_selected = pair_mask.unsqueeze(-1).expand(B, N, C_rel)
                 class_mask = rel_prompts_embedding_mask.unsqueeze(1).expand(B, N, C_rel)
 
-                rel_loss = self.rel_loss(pair_scores, rel_labels_selected, rel_mask_selected, class_mask, **kwargs)
+                rel_kwargs = dict(kwargs)
+                rel_kwargs['alpha'] = rel_kwargs.pop('rel_alpha', rel_kwargs.get('alpha', -1.0))
+                rel_kwargs['gamma'] = rel_kwargs.pop('rel_gamma', rel_kwargs.get('gamma', 0.0))
 
-                loss = (
-                    loss * self.config.span_loss_coef
-                    + adj_loss * self.config.adjacency_loss_coef
-                    + rel_loss * self.config.relation_loss_coef
-                )
+                rel_loss = self.rel_loss(pair_scores, rel_labels_selected, rel_mask_selected, class_mask, **rel_kwargs)
 
+                span_loss = loss * self.config.span_loss_coef if loss is not None else 0.0
+
+                if hasattr(self, "relations_rep_layer") and adj_matrix is not None:
+                    adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
+                    adj_loss = self.adj_loss(pred_adj_matrix, adj_matrix, adj_mask, **rel_kwargs)
+
+                    loss = (
+                        span_loss
+                        + adj_loss * self.config.adjacency_loss_coef
+                        + rel_loss * self.config.relation_loss_coef
+                    )
+                else:
+                    loss = (
+                        span_loss
+                        + rel_loss * self.config.relation_loss_coef
+                    )
+
+        # During training, rel_logits/rel_idx/rel_mask/entity_spans can have
+        # variable sizes across batch splits (different C_rel or N per GPU),
+        # which causes DataParallel gather to fail. Only loss is needed for
+        # training, so skip these tensors when labels are provided.
+        is_training = labels is not None
         output = GLiNERRelexOutput(
             logits=scores,
             loss=loss,
@@ -2284,9 +2375,10 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
             prompts_embedding_mask=prompts_embedding_mask,
             words_embedding=words_embedding,
             mask=mask,
-            rel_idx=pair_idx,
-            rel_logits=pair_scores,
-            rel_mask=pair_mask,
+            rel_idx=None if is_training else pair_idx,
+            rel_logits=None if is_training else pair_scores,
+            rel_mask=None if is_training else pair_mask,
+            entity_spans=None if is_training else entity_spans,
         )
         return output
 
@@ -2477,19 +2569,20 @@ class UniEncoderTokenRelexModel(UniEncoderSpanRelexModel):
         """
         all_losses = self._loss(scores, labels, alpha, gamma, prob_margin, label_smoothing, negatives)
 
-        all_losses = all_losses * (word_mask.unsqueeze(-1) * prompts_embedding_mask.unsqueeze(1)).unsqueeze(-1)
+        masked_loss = all_losses * (word_mask.unsqueeze(-1) * prompts_embedding_mask.unsqueeze(1)).unsqueeze(-1)
 
         if reduction == "mean":
-            loss = all_losses.mean()
+            num_valid = (word_mask.unsqueeze(-1) * prompts_embedding_mask.unsqueeze(1)).sum()
+            loss = masked_loss.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, device=scores.device)
         elif reduction == "sum":
-            loss = all_losses.sum()
+            loss = masked_loss.sum()
         else:
             warnings.warn(
                 f"Invalid Value for config 'loss_reduction': '{reduction}' \n Supported reduction modes:"
                 f" 'none', 'mean', 'sum'. It will be used 'sum' instead.",
                 stacklevel=2,
             )
-            loss = all_losses.sum()
+            loss = masked_loss.sum()
         return loss
 
     def represent_spans(
@@ -2509,4 +2602,5 @@ class UniEncoderTokenRelexModel(UniEncoderSpanRelexModel):
             span_idx = span_idx * span_mask.unsqueeze(-1).long()
         target_span_rep = self.span_rep_layer(words_embeddings, span_idx)
 
-        return scores, target_span_rep, span_mask
+        # span_idx directly corresponds to target_span_rep positions
+        return scores, target_span_rep, span_mask, span_idx
